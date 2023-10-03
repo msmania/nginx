@@ -15,9 +15,19 @@
 
 
 typedef struct {
+    ngx_chain_t                cache;
     ngx_http_complex_value_t  *realm;
     ngx_http_complex_value_t  *user_file;
 } ngx_http_auth_basic_loc_conf_t;
+
+
+typedef struct {
+    off_t                            offset;
+    ngx_file_t                       file;
+    ngx_chain_t                     *chain;
+    ngx_http_request_t              *r;
+    ngx_http_auth_basic_loc_conf_t  *alcf;
+} ngx_http_auth_basic_file_ctx_t;
 
 
 static ngx_int_t ngx_http_auth_basic_handler(ngx_http_request_t *r);
@@ -31,6 +41,14 @@ static char *ngx_http_auth_basic_merge_loc_conf(ngx_conf_t *cf,
 static ngx_int_t ngx_http_auth_basic_init(ngx_conf_t *cf);
 static char *ngx_http_auth_basic_user_file(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static ngx_int_t ngx_http_auth_basic_read_file(ngx_pool_t *pool,
+    ngx_str_t *filename, ngx_log_t *log, ngx_chain_t *chain_out);
+static ngx_int_t ngx_http_auth_basic_init_file_ctx(
+    ngx_http_auth_basic_file_ctx_t *ctx);
+static ssize_t ngx_http_auth_basic_read_file_ctx(
+    ngx_http_auth_basic_file_ctx_t *ctx, u_char *buf_out, size_t size);
+static void ngx_http_auth_basic_cleanup_file_ctx(
+    ngx_http_auth_basic_file_ctx_t *ctx);
 
 
 static ngx_command_t  ngx_http_auth_basic_commands[] = {
@@ -89,14 +107,11 @@ ngx_module_t  ngx_http_auth_basic_module = {
 static ngx_int_t
 ngx_http_auth_basic_handler(ngx_http_request_t *r)
 {
-    off_t                            offset;
     ssize_t                          n;
-    ngx_fd_t                         fd;
     ngx_int_t                        rc;
-    ngx_err_t                        err;
-    ngx_str_t                        pwd, realm, user_file;
-    ngx_uint_t                       i, level, login, left, passwd;
-    ngx_file_t                       file;
+    ngx_str_t                        pwd, realm;
+    ngx_uint_t                       i, login, left, passwd;
+    ngx_http_auth_basic_file_ctx_t   file_ctx;
     ngx_http_auth_basic_loc_conf_t  *alcf;
     u_char                           buf[NGX_HTTP_AUTH_BUF_SIZE];
     enum {
@@ -133,47 +148,20 @@ ngx_http_auth_basic_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    if (ngx_http_complex_value(r, alcf->user_file, &user_file) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
-    fd = ngx_open_file(user_file.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
-
-    if (fd == NGX_INVALID_FILE) {
-        err = ngx_errno;
-
-        if (err == NGX_ENOENT) {
-            level = NGX_LOG_ERR;
-            rc = NGX_HTTP_FORBIDDEN;
-
-        } else {
-            level = NGX_LOG_CRIT;
-            rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
-        }
-
-        ngx_log_error(level, r->connection->log, err,
-                      ngx_open_file_n " \"%s\" failed", user_file.data);
-
-        return rc;
-    }
-
-    ngx_memzero(&file, sizeof(ngx_file_t));
-
-    file.fd = fd;
-    file.name = user_file;
-    file.log = r->connection->log;
+    file_ctx.alcf = alcf;
+    file_ctx.r = r;
+    ngx_http_auth_basic_init_file_ctx(&file_ctx);
 
     state = sw_login;
     passwd = 0;
     login = 0;
     left = 0;
-    offset = 0;
 
     for ( ;; ) {
         i = left;
 
-        n = ngx_read_file(&file, buf + left, NGX_HTTP_AUTH_BUF_SIZE - left,
-                          offset);
+        n = ngx_http_auth_basic_read_file_ctx(&file_ctx, buf + left,
+                                              NGX_HTTP_AUTH_BUF_SIZE - left);
 
         if (n == NGX_ERROR) {
             rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -245,8 +233,6 @@ ngx_http_auth_basic_handler(ngx_http_request_t *r)
         } else {
             left = 0;
         }
-
-        offset += n;
     }
 
     if (state == sw_passwd) {
@@ -264,16 +250,13 @@ ngx_http_auth_basic_handler(ngx_http_request_t *r)
 
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                   "user \"%V\" was not found in \"%s\"",
-                  &r->headers_in.user, user_file.data);
+                  &r->headers_in.user, &file_ctx.file.name.data);
 
     rc = ngx_http_auth_basic_set_realm(r, &realm);
 
 cleanup:
 
-    if (ngx_close_file(file.fd) == NGX_FILE_ERROR) {
-        ngx_log_error(NGX_LOG_ALERT, r->connection->log, ngx_errno,
-                      ngx_close_file_n " \"%s\" failed", user_file.data);
-    }
+    ngx_http_auth_basic_cleanup_file_ctx(&file_ctx);
 
     ngx_explicit_memzero(buf, NGX_HTTP_AUTH_BUF_SIZE);
 
@@ -374,6 +357,19 @@ ngx_http_auth_basic_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_ptr_value(conf->realm, prev->realm, NULL);
     ngx_conf_merge_ptr_value(conf->user_file, prev->user_file, NULL);
 
+    if (conf->user_file != NULL && conf->user_file->lengths == NULL) {
+
+        /*
+         * If the given expression is a static text, we read the file at
+         * configuration time.
+         */
+
+        if (ngx_http_auth_basic_read_file(cf->pool, &conf->user_file->value,
+                                          cf->log, &conf->cache) != NGX_OK) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
     return NGX_CONF_OK;
 }
 
@@ -429,4 +425,208 @@ ngx_http_auth_basic_user_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     return NGX_CONF_OK;
+}
+
+
+static ngx_int_t
+ngx_http_auth_basic_read_file(ngx_pool_t *pool, ngx_str_t *filename,
+    ngx_log_t *log, ngx_chain_t *chain_out)
+{
+    off_t         offset;
+    ssize_t       n;
+    ngx_fd_t      fd;
+    ngx_buf_t    *p;
+    ngx_int_t     rc;
+    ngx_file_t    file;
+    ngx_chain_t  *cl;
+    u_char        buf[NGX_HTTP_AUTH_BUF_SIZE];
+
+    if (chain_out == NULL
+        || chain_out->buf != NULL
+        || chain_out->next != NULL) {
+        ngx_log_error(NGX_LOG_ALERT, log, ngx_errno,
+                      "ngx_http_auth_basic_read_file() accepts only an empty"
+                      " chain.");
+        return NGX_ERROR;
+    }
+
+    fd = ngx_open_file(filename->data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+    if (fd == NGX_INVALID_FILE) {
+        ngx_log_error(NGX_LOG_ALERT, log, ngx_errno,
+                      ngx_open_file_n " \"%V\" failed", filename);
+        return NGX_ENOENT;
+    }
+
+    ngx_memzero(&file, sizeof(ngx_file_t));
+    file.fd = fd;
+    file.name = *filename;
+    file.log = log;
+
+    rc = NGX_OK;
+
+    for (offset = 0; /* void */ ; offset += n) {
+        n = ngx_read_file(&file, buf, NGX_HTTP_AUTH_BUF_SIZE, offset);
+        if (n == 0) {
+            break;
+
+        } else if (n == NGX_ERROR) {
+            rc = NGX_ERROR;
+            break;
+        }
+
+        p = ngx_create_temp_buf(pool, n);
+        if (p == NULL) {
+            rc = NGX_ENOMEM;
+            ngx_log_error(NGX_LOG_ALERT, log, ngx_errno,
+                          "Cannot allocate a buffer");
+            break;
+        }
+
+        ngx_memcpy(p->start, buf, n);
+
+        if (chain_out->buf == NULL) {
+
+            /* First chain is provided by the caller.  No allocation needed. */
+
+            chain_out->buf = p;
+
+        } else {
+            cl = ngx_alloc_chain_link(pool);
+            if (cl == NULL) {
+                rc = NGX_ENOMEM;
+                ngx_log_error(NGX_LOG_ALERT, log, ngx_errno,
+                              "Cannot allocate a chain");
+                break;
+            }
+
+            cl->buf = p;
+            chain_out->next = cl;
+            chain_out = cl;
+        }
+    }
+
+    if (ngx_close_file(fd) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ALERT, log, ngx_errno,
+                      ngx_close_file_n " \"%V\" failed", filename);
+    }
+
+    return rc;
+}
+
+
+static ngx_int_t
+ngx_http_auth_basic_init_file_ctx(ngx_http_auth_basic_file_ctx_t *ctx)
+{
+    ngx_fd_t                         fd;
+    ngx_err_t                        err;
+    ngx_int_t                        rc;
+    ngx_str_t                        user_file;
+    ngx_uint_t                       level;
+    ngx_http_request_t              *r;
+    ngx_http_auth_basic_loc_conf_t  *alcf;
+
+    r = ctx->r;
+    alcf = ctx->alcf;
+
+    ngx_memzero(&ctx->file, sizeof(ngx_file_t));
+    ctx->chain = NULL;
+    ctx->offset = 0;
+
+    if (alcf->user_file->lengths == NULL) {
+        ctx->chain = &alcf->cache;
+        ctx->file.name = alcf->user_file->value;
+        return NGX_OK;
+    }
+
+    if (ngx_http_complex_value(r, alcf->user_file, &user_file) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    fd = ngx_open_file(user_file.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+
+    if (fd == NGX_INVALID_FILE) {
+        err = ngx_errno;
+
+        if (err == NGX_ENOENT) {
+            level = NGX_LOG_ERR;
+            rc = NGX_HTTP_FORBIDDEN;
+
+        } else {
+            level = NGX_LOG_CRIT;
+            rc = NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+
+        ngx_log_error(level, r->connection->log, err,
+                      ngx_open_file_n " \"%s\" failed", user_file.data);
+
+        return rc;
+    }
+
+    ctx->file.fd = fd;
+    ctx->file.name = user_file;
+    ctx->file.log = r->connection->log;
+
+    return NGX_OK;
+}
+
+
+static ssize_t
+ngx_http_auth_basic_read_file_ctx(ngx_http_auth_basic_file_ctx_t *ctx,
+    u_char *buf_out, size_t size)
+{
+    off_t         offset;
+    size_t        remaining;
+    u_char       *p;
+    ssize_t       n;
+    ngx_buf_t    *buf;
+    ngx_chain_t  *cl;
+
+    if (!ctx->alcf->user_file->lengths) {
+        offset = ctx->offset;
+        p = buf_out;
+        n = 0;
+
+        for (cl = ctx->chain; cl; cl = cl->next) {
+            buf = cl->buf;
+            remaining = buf->end - buf->start - offset;
+            if (size <= remaining) {
+                ngx_memcpy(p, buf->start, size);
+                n += size;
+                offset += size;
+                break;
+            }
+
+            ngx_memcpy(p, buf->start, remaining);
+            n += remaining;
+            p += remaining;
+            size -= remaining;
+            offset = 0;
+        }
+
+        ctx->chain = cl;
+        ctx->offset = offset;
+        return n;
+    }
+
+    n = ngx_read_file(&ctx->file, buf_out, size, ctx->offset);
+    if (n == NGX_ERROR) {
+        return NGX_ERROR;
+    }
+
+    ctx->offset += n;
+    return n;
+}
+
+
+static void
+ngx_http_auth_basic_cleanup_file_ctx(ngx_http_auth_basic_file_ctx_t *ctx)
+{
+    if (ctx->alcf->user_file->lengths == NULL) {
+        return;
+    }
+
+    if (ngx_close_file(ctx->file.fd) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ALERT, ctx->r->connection->log, ngx_errno,
+                      ngx_close_file_n " \"%s\" failed", ctx->file.name.data);
+    }
 }
